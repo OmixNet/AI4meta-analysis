@@ -1,4 +1,4 @@
-streamlit
-pandas
-openai
-tenacity
+streamlit>=1.32,<2.0
+pandas>=2.0,<3.0
+openai>=1.40,<2.0
+tenacity>=8.2,<10.0
