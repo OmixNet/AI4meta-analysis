@@ -5,3 +5,4 @@ __pycache__/
 .env
 .venv/
 venv/
+rob2_debug.log
