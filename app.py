@@ -90,7 +90,24 @@ DECISION_ALIASES = {
 }
 ROB_EVALUATOR_DOMAINS = ["D1", "D2", "D3", "D4", "D5"]
 ROB_DOMAINS = [*ROB_EVALUATOR_DOMAINS, "Overall"]
-ROB_OUTPUT_COLUMNS = ["Study", *ROB_DOMAINS]
+ROB_REVIEWER_COUNT = 3
+ROB_SUMMARY_COLUMNS = ["Study", "Evaluator", *ROB_DOMAINS]
+ROB_DETAIL_COLUMNS = [
+    "Study",
+    "Evaluator",
+    "D1",
+    "D1_reason",
+    "D2",
+    "D2_reason",
+    "D3",
+    "D3_reason",
+    "D4",
+    "D4_reason",
+    "D5",
+    "D5_reason",
+    "Overall",
+    "Overall_reason",
+]
 ROB_ALLOWED_SCORES = {"Low", "Some concerns", "High"}
 ROB_SCORE_ALIASES = {
     "low": "Low",
@@ -217,43 +234,103 @@ ROB2_DOMAIN_RUBRIC = """
 """.strip()
 
 EVALUATOR_SYSTEM_PROMPT = """
-你现在是一位非常严苛、注重细节、专门负责挑刺的 Cochrane 循证医学方法学家。你的任务不是给作者好评，而是主动寻找偏倚风险。你必须仔细阅读我提供的随机对照试验（RCT）全文，并严格按照 Cochrane Risk of Bias 2 (RoB 2) 工具的标准，对 5 个领域及总体偏倚进行风险评估。
+你现在是一位拥有 20 年经验、极其严苛且注重细节的 Cochrane 循证医学方法学家。你的任务是阅读我提供的随机对照试验（RCT）全文片段，主动寻找并揭露研究中可能存在的“偏倚风险（Risk of Bias）”，而不是迎合作者的结论。
+请严格按照 Cochrane RoB 2 工具的标准，对 5 个特定领域（D1-D5）及总体偏倚（Overall）进行判定。
 
-【RoB 2 评价标准指引】：
-- D1 随机化过程的偏倚：重点寻找分配序列如何产生、分配隐藏方法，以及基线特征是否平衡。
-- D2 偏离既定干预措施的偏倚：重点寻找受试者和实施者是否盲法，是否发生方案偏离，以及是否采用意向性分析（ITT）评估分配干预的效果。
-- D3 结局数据缺失的偏倚：重点寻找受试者脱落率、两组缺失比例是否平衡、缺失原因，以及是否进行了合理的插补分析。
-- D4 结局测量的偏倚：重点寻找结局评估者是否盲法，测量方法是否客观并在两组间保持一致。
-- D5 报告结果选择的偏倚：重点寻找是否有预先注册的试验方案，报告的结局和分析方法是否被选择性挑出（如只报告阳性结果）。
+【核心执行路径】（必须按顺序严格执行）
+1. 逐域扫描：在提供的证据包中，搜寻与 D1-D5 直接相关的段落、图表注或数据。
+2. 证据匹配：将原文表述与下方提供的【评估指引与示例】进行比对。
+3. 强制判定：绝不允许弃权。如果证据完全缺失，必须判定为 "Some concerns" 并注明“信息不足”。
+4. 输出 JSON：完成内心推演后，严格按照底部要求的 JSON 格式输出最终结果。
 
-【总体偏倚 (Overall) 判定严格逻辑】：
-- Low：所有 D1-D5 均为 Low。
-- Some concerns：至少 1 个维度是 Some concerns，且没有任何维度是 High。
-- High：至少 1 个维度是 High，或多个维度是 Some concerns 从而实质性降低了整体信心。
+【逐域评估指引与高阶判定示例】
+D1: 随机化过程的偏倚 (Randomization process)
+重点检查：序列生成是否真正随机、分配隐藏（Allocation concealment）是否严密、基线特征（特别是核心疾病指标）是否平衡。
+🟢 Low (低风险) 示例：
+原文献表述：“由独立统计中心通过中央网络系统进行区组随机化，使用不透光的密封信封。两组患者的基线 BMI、HbA1c 和血脂水平等特征均无统计学显著差异。”
+对应的 50 字 reason：中央网络随机系统与不透光信封确保了分配隐藏，且核心代谢基线特征高度平衡。
+🟡 Some concerns (存在疑虑) 示例：
+原文献表述：“符合纳入标准的肥胖患者被随机分配到标志物指导组或常规治疗组。表 1 显示两组年龄、性别相似。”（注：未说明隐藏方法，且表 1 缺失了关键的基线体重数据）
+对应的 50 字 reason：提及随机但未报告序列生成与分配隐藏的具体方法，且基线表中缺失核心疾病特征数据。
+🔴 High (高风险) 示例：
+原文献表述：“患者根据入院的单双日进行分组。分析显示，干预组的平均病程显著长于对照组（P=0.01）。”
+对应的 50 字 reason：按入院日期分组属准随机化（非真正随机），且基线病程存在显著失衡，严重干扰结局评价。
 
-【强制执行路径】：
-""" + "\n" + ROB2_STRICT_WORKFLOW + "\n\n" + """
-【逐域量化尺子】：
-""" + "\n" + ROB2_DOMAIN_RUBRIC + "\n\n" + """
+D2: 偏离既定干预措施的偏倚 (Deviations from intended interventions)
+重点检查：盲法实施情况、是否发生严重方案偏离、以及数据分析是否严格遵循意向性分析（ITT）原则以评估“分配”的效果。
+🟢 Low (低风险) 示例：
+原文献表述：“采用外观、气味完全一致的安慰剂进行双盲。最终分析集包含了所有随机化的 500 名患者（ITT 分析），无论其是否按要求服药。”
+对应的 50 字 reason：双盲安慰剂对照实施彻底，且严格采用意向性分析（ITT）涵盖所有随机化受试者。
+🟡 Some concerns (存在疑虑) 示例：
+原文献表述：“由于饮食干预的特殊性，本研究为开放标签（未设盲）。分析采用了 ITT 原则。”（注：虽然分析正确，但开放标签容易导致对照组自行改变生活方式）
+对应的 50 字 reason：采用 ITT 分析，但开放标签设计可能导致参与者知晓分组从而改变行为，存在一定偏离风险。
+🔴 High (高风险) 示例：
+原文献表述：“干预组中有 25% 的患者因无法耐受高蛋白配方而退出。我们在最终分析中剔除了这些患者，仅对完成完整干预的患者进行符合方案分析（Per-protocol）。”
+对应的 50 字 reason：干预组因不耐受出现极高退出率，且采用符合方案分析剔除了这些数据，彻底破坏了随机化。
 
-补充要求：
-- 你必须结合全文证据独立判断，不要迎合其他评价员，也不要为了省事跳过任一维度。
-- 你必须在内部 step by step 完成逐域分析，再输出最终 JSON；不要把内部推理过程输出到 JSON 之外。
-- 优先引用或紧贴原文证据；若文中未报告，请直接写“未报告”或“信息不足”。
-- 每个 `reason` 必须控制在 50 个汉字以内。
-- 所有键都必须完整输出，缺失任意一个键都视为失败。
-- 不允许空字符串、`null`、`N/A`、`unknown` 之类占位值。
-- 每个 `score` 的值必须且只能是 "Low"、"Some concerns" 或 "High"。
-- 不要输出 JSON 以外的任何文字。
+D3: 结局数据缺失的偏倚 (Missing outcome data)
+重点检查：失访/脱落率的绝对值、组间缺失比例是否对称、缺失原因是否与干预措施或疾病进展直接相关。
+🟢 Low (低风险) 示例：
+原文献表述：“两年随访期内，干预组失访 3 例，对照组失访 4 例（总脱落率 < 2%），主要原因为患者搬迁出本市。”
+对应的 50 字 reason：总体脱落率极低（<2%），组间缺失比例平衡，且缺失原因与研究结局或干预措施无关。
+🟡 Some concerns (存在疑虑) 示例：
+原文献表述：“两组均有约 15% 的患者未能提供第 12 周的血样。我们使用了末次观测值结转法（LOCF）进行数据插补。”
+对应的 50 字 reason：缺失率达15%且仅使用简单的LOCF插补，未报告缺失的具体原因，可能影响纵向代谢指标评估。
+🔴 High (高风险) 示例：
+原文献表述：“新型药物组在第 6 个月时有 38% 的患者因肝功能指标异常而停止随访并缺失结局数据，而安慰剂组的缺失率仅为 5%。”
+对应的 50 字 reason：实验组因不良反应导致极高（38%）且极不平衡的数据缺失，直接影响最终疗效与安全性评价。
 
-请严格输出以下 JSON：
+D4: 结局测量的偏倚 (Measurement of the outcome)
+重点检查：结局指标的客观性、结局评估者（Outcome assessors）是否设盲、测量工具在组间是否一致。
+🟢 Low (低风险) 示例：
+原文献表述：“主要终点由中心实验室通过质谱法统一检测血清代谢物谱。实验室人员对患者的分组信息和临床特征完全盲法。”
+对应的 50 字 reason：采用高度客观的仪器检测硬终点，且中心实验室评估人员处于严格盲法状态。
+🟡 Some concerns (存在疑虑) 示例：
+原文献表述：“次要结局为超声诊断的脂肪肝消退情况。由同一位放射科医生完成所有阅片。”（注：虽然同一个人看片，但未说明该医生看片时是否知道患者是哪一组的）
+对应的 50 字 reason：超声阅片依赖评估者主观判断，且文中未明确报告该结局评估者是否实施了盲法。
+🔴 High (高风险) 示例：
+原文献表述：“在开放标签试验中，主要临床终点是患者每周自行填写的食欲抑制问卷和主观疲劳度视觉模拟评分（VAS）。”
+对应的 50 字 reason：在非盲法试验中采用患者主观填写的量表作为终点，受试者极易受知晓分组情况的心理暗示影响。
+
+D5: 报告结果选择的偏倚 (Selection of the reported result)
+重点检查：有无预先注册的试验方案（Protocol）、分析计划是否在解盲前锁定、是否存在“P值操纵”或选择性报告阳性结果。
+🟢 Low (低风险) 示例：
+原文献表述：“本试验于入组首例患者前在 ClinicalTrials.gov 注册（NCT0123456），统计分析计划（SAP）于数据锁定前发布。本文报告的主要和次要结局与注册方案完全一致。”
+对应的 50 字 reason：拥有前瞻性试验注册与预设分析计划，且最终论文报告的终点指标与注册方案严丝合缝。
+🟡 Some concerns (存在疑虑) 示例：
+原文献表述：“文中报告了多个标志物在 3、6、12 个月的变化情况，但我们在各类公开数据库中均未检索到该研究的前瞻性注册记录。”
+对应的 50 字 reason：缺乏前瞻性试验注册与公开方案，无法核实文中所报告的时间点和指标是否经过了选择性挑选。
+🔴 High (高风险) 示例：
+原文献表述：“试验注册的主要终点是连续变量（体重下降的绝对千克数），但由于两组无显著差异，论文中仅报告了‘体重下降 > 5% 的患者比例’（P=0.04）。”
+对应的 50 字 reason：擅自更改预先注册的主要终点分析类型，将其从连续变量改为分类变量以强行获得阳性 P 值。
+
+【总体偏倚 (Overall) 裁决逻辑】
+你必须在完成 D1-D5 后计算 Overall：
+- Low：只有当 D1-D5 全部为 Low 时。
+- High：只要 D1-D5 中有任意 1 个及以上为 High 时。
+- Some concerns：只要 D1-D5 中没有 High，但包含至少 1 个 Some concerns 时。
+
+【严格输出约束与硬容错规则】
+- 完整性校验：必须且只能输出包含 12 个键值对的单一 JSON 对象，绝不允许省略。
+- 值域限制：*_score 的值必须且只能是 "Low"、"Some concerns" 或 "High" 中的一个。
+- 理由压缩：*_reason 必须浓缩原文最直接的证据，字数控制在 50个汉字以内。如果找不到证据，请填写“原文信息不足，采取保守评级”。
+- 禁止乱码：绝对禁止输出类似 ","、"..."、"null" 或空字符串。如果你感到困惑或难以决断，请直接默认输出 "Some concerns"。
+- 纯净输出：不要输出任何开场白、解释性文字或 Markdown 以外的内容。
+
+请严格复制并填入以下 JSON 模板进行输出：
 {
-  "D1_score": "Low/Some concerns/High", "D1_reason": "不超过50个字的理由",
-  "D2_score": "Low/Some concerns/High", "D2_reason": "不超过50个字的理由",
-  "D3_score": "Low/Some concerns/High", "D3_reason": "不超过50个字的理由",
-  "D4_score": "Low/Some concerns/High", "D4_reason": "不超过50个字的理由",
-  "D5_score": "Low/Some concerns/High", "D5_reason": "不超过50个字的理由",
-  "Overall_score": "Low/Some concerns/High", "Overall_reason": "不超过50个字的理由"
+  "D1_score": "Low/Some concerns/High",
+  "D1_reason": "不超过50字的证据总结或说明信息不足",
+  "D2_score": "Low/Some concerns/High",
+  "D2_reason": "不超过50字的证据总结或说明信息不足",
+  "D3_score": "Low/Some concerns/High",
+  "D3_reason": "不超过50字的证据总结或说明信息不足",
+  "D4_score": "Low/Some concerns/High",
+  "D4_reason": "不超过50字的证据总结或说明信息不足",
+  "D5_score": "Low/Some concerns/High",
+  "D5_reason": "不超过50字的证据总结或说明信息不足",
+  "Overall_score": "Low/Some concerns/High",
+  "Overall_reason": "基于D1-D5的总体裁决理由摘要"
 }
 """.strip()
 
@@ -1631,11 +1708,27 @@ def aggregate_rob_scores(
         return fallback_result
 
 
-def build_rob_error_row(study: str, message: str = "全文偏倚评估失败") -> dict[str, Any]:
-    row = {"Study": study}
-    row.update({domain: "Error" for domain in ROB_DOMAINS})
-    row["_error"] = message[:200] if message else "全文偏倚评估失败"
-    return row
+def build_reviewer_output_rows(study: str, evaluator_results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for reviewer_id, result in enumerate(evaluator_results, start=1):
+        row = {"Study": study, "Evaluator": f"Evaluator {reviewer_id}"}
+        for domain in ROB_DOMAINS:
+            row[domain] = result.get(f"{domain}_score", "Error")
+            row[f"{domain}_reason"] = result.get(f"{domain}_reason", "原文信息不足，采取保守评级")
+        rows.append(row)
+    return rows
+
+
+def build_rob_error_rows(study: str, message: str = "全文偏倚评估失败") -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    error_reason = (message[:80] if message else "全文偏倚评估失败") or "全文偏倚评估失败"
+    for reviewer_id in range(1, ROB_REVIEWER_COUNT + 1):
+        row = {"Study": study, "Evaluator": f"Evaluator {reviewer_id}"}
+        row.update({domain: "Error" for domain in ROB_DOMAINS})
+        row.update({f"{domain}_reason": error_reason for domain in ROB_DOMAINS})
+        row["_error"] = message[:200] if message else "全文偏倚评估失败"
+        rows.append(row)
+    return rows
 
 
 def prepare_rob_jobs(uploaded_files: list[Any], local_text_paths: str = "") -> list[dict[str, Any]]:
@@ -1761,14 +1854,14 @@ def process_single_document_for_rob(
                 "evidence_chars": len(evidence_text),
             }
         )
-        progress_queue.put({"study": study, "stage": "collecting", "completed": 0, "total": 3})
+        progress_queue.put({"study": study, "stage": "collecting", "completed": 0, "total": ROB_REVIEWER_COUNT})
 
         executor = ThreadPoolExecutor(max_workers=3)
         future_to_reviewer: dict[Any, int] = {}
         try:
             future_to_reviewer = {
                 executor.submit(evaluate_single_reviewer, config, study, evidence_text, reviewer_id): reviewer_id
-                for reviewer_id in range(1, 4)
+                for reviewer_id in range(1, ROB_REVIEWER_COUNT + 1)
             }
             evaluator_results_map: dict[int, dict[str, Any]] = {}
 
@@ -1776,21 +1869,22 @@ def process_single_document_for_rob(
                 reviewer_id = future_to_reviewer[future]
                 evaluator_results_map[reviewer_id] = future.result()
                 LOGGER.info(
-                    "Evaluator collected | study=%s | reviewer=%s | completed=%s/3",
+                    "Evaluator collected | study=%s | reviewer=%s | completed=%s/%s",
                     study,
                     reviewer_id,
                     completed_count,
+                    ROB_REVIEWER_COUNT,
                 )
                 progress_queue.put(
                     {
                         "study": study,
                         "stage": "collecting",
                         "completed": completed_count,
-                        "total": 3,
+                        "total": ROB_REVIEWER_COUNT,
                     }
                 )
 
-            evaluator_results = [evaluator_results_map[reviewer_id] for reviewer_id in range(1, 4)]
+            evaluator_results = [evaluator_results_map[reviewer_id] for reviewer_id in range(1, ROB_REVIEWER_COUNT + 1)]
         except Exception:
             for future in future_to_reviewer:
                 future.cancel()
@@ -1799,20 +1893,23 @@ def process_single_document_for_rob(
         else:
             executor.shutdown(wait=True)
 
-        progress_queue.put({"study": study, "stage": "aggregating"})
-        final_result = aggregate_rob_scores(config, study, evaluator_results)
         progress_queue.put({"study": study, "stage": "completed"})
-        LOGGER.info("Study completed | study=%s | overall=%s", study, final_result.get("Overall", ""))
+        reviewer_rows = build_reviewer_output_rows(study, evaluator_results)
+        LOGGER.info("Study completed | study=%s | reviewers=%s", study, len(reviewer_rows))
         return {
             "Study": study,
-            **final_result,
+            "rows": reviewer_rows,
             "_error": "",
         }
     except Exception as exc:  # noqa: BLE001
         message = short_error_message(exc)
         LOGGER.exception("Study failed | study=%s | error=%s", study, message)
         progress_queue.put({"study": study, "stage": "error", "message": message})
-        return build_rob_error_row(study, message)
+        return {
+            "Study": study,
+            "rows": build_rob_error_rows(study, message),
+            "_error": message[:200] if message else "全文偏倚评估失败",
+        }
 
 
 def format_rob_progress_text(total: int, completed: int, study_statuses: dict[str, str]) -> str:
@@ -1852,12 +1949,10 @@ def consume_rob_progress_events(progress_queue: queue.Queue, study_statuses: dic
                 status_text = f"PDF文本提取完成：{pages} 页，原文约 {chars:,} 字符，评估证据约 {evidence_chars:,} 字符"
         elif stage == "collecting":
             completed = int(event.get("completed", 0) or 0)
-            total = int(event.get("total", 3) or 3)
-            status_text = f"正在收集 3 位专家的独立评估...（已完成 {completed}/{total}）"
-        elif stage == "aggregating":
-            status_text = "正在汇总最终结果..."
+            total = int(event.get("total", ROB_REVIEWER_COUNT) or ROB_REVIEWER_COUNT)
+            status_text = f"正在收集 {ROB_REVIEWER_COUNT} 位专家的独立评估...（已完成 {completed}/{total}）"
         elif stage == "completed":
-            status_text = "已完成"
+            status_text = "3 位评价员结果已生成"
         elif stage == "error":
             status_text = f"处理失败：{event.get('message', '未知错误')[:120]}"
         else:
@@ -1882,9 +1977,12 @@ def run_batch_rob_assessment(
 ) -> tuple[pd.DataFrame, list[dict[str, str]]]:
     total = len(jobs)
     if total == 0:
-        return pd.DataFrame(columns=ROB_OUTPUT_COLUMNS), []
+        return pd.DataFrame(columns=ROB_DETAIL_COLUMNS), []
 
-    results: list[dict[str, Any]] = [build_rob_error_row(job["study"], "任务未执行") for job in jobs]
+    results: list[dict[str, Any]] = [
+        {"Study": job["study"], "rows": build_rob_error_rows(job["study"], "任务未执行"), "_error": "任务未执行"}
+        for job in jobs
+    ]
     progress_queue: queue.Queue = queue.Queue()
     study_statuses: dict[str, str] = {}
 
@@ -1921,7 +2019,12 @@ def run_batch_rob_assessment(
                 try:
                     results[index] = future.result()
                 except Exception as exc:  # noqa: BLE001
-                    results[index] = build_rob_error_row(jobs[index]["study"], short_error_message(exc))
+                    message = short_error_message(exc)
+                    results[index] = {
+                        "Study": jobs[index]["study"],
+                        "rows": build_rob_error_rows(jobs[index]["study"], message),
+                        "_error": message,
+                    }
                 completed += 1
                 progress_bar.progress(completed / total)
                 should_refresh = True
@@ -1931,14 +2034,16 @@ def run_batch_rob_assessment(
 
     consume_rob_progress_events(progress_queue, study_statuses)
 
-    result_df = pd.DataFrame(
-        [{column: row.get(column, "Error") for column in ROB_OUTPUT_COLUMNS} for row in results],
-        columns=ROB_OUTPUT_COLUMNS,
-    )
+    flattened_rows = [
+        {column: row.get(column, "Error") for column in ROB_DETAIL_COLUMNS}
+        for result in results
+        for row in result.get("rows", [])
+    ]
+    result_df = pd.DataFrame(flattened_rows, columns=ROB_DETAIL_COLUMNS)
     error_records = [
         {"Study": row["Study"], "Error": row.get("_error", "未知错误")}
         for row in results
-        if any(row.get(domain) == "Error" for domain in ROB_DOMAINS)
+        if any(item.get(domain) == "Error" for item in row.get("rows", []) for domain in ROB_DOMAINS)
     ]
     return result_df, error_records
 
@@ -2087,7 +2192,7 @@ def render_screening_tab(config: ApiConfig, max_workers: int) -> None:
 
 
 def render_rob_tab(config: ApiConfig) -> None:
-    st.caption("上传 RCT 全文 PDF，或直接提供已提取的 Markdown/TXT 全文，系统将采用 3 位独立评价员并发评估，再由 1 位资深主裁进行最终仲裁。")
+    st.caption("上传 RCT 全文 PDF，或直接提供已提取的 Markdown/TXT 全文，系统将采用 3 位独立评价员并发评估，并分别输出 3 份 RoB 2 结果。")
 
     uploaded_files = st.file_uploader(
         "上传全文 PDF / Markdown / TXT 文件",
@@ -2107,7 +2212,7 @@ def render_rob_tab(config: ApiConfig) -> None:
         min_value=1,
         max_value=3,
         value=1,
-        help="每篇文章会触发 4 次 API 调用，请根据模型配额与限流情况谨慎调整。",
+        help="每篇文章会触发 3 次 API 调用，请根据模型配额与限流情况谨慎调整。",
     )
     use_llm_pdf_extraction = st.checkbox(
         "启用大模型辅助PDF提取",
@@ -2145,10 +2250,21 @@ def render_rob_tab(config: ApiConfig) -> None:
         )
 
     progress_bar.progress(1.0)
-    status_placeholder.success(f"处理完成: {len(result_df)} / {len(result_df)} 篇")
+    status_placeholder.success(f"处理完成: {len(jobs)} / {len(jobs)} 篇")
 
-    st.subheader("RoB 2 最终结果")
-    st.dataframe(result_df, use_container_width=True)
+    summary_df = result_df[ROB_SUMMARY_COLUMNS].copy()
+
+    st.subheader("RoB 2 评价员评分表")
+    st.dataframe(summary_df, use_container_width=True)
+
+    with st.expander("查看含理由的完整明细表", expanded=True):
+        st.dataframe(result_df, use_container_width=True)
+
+        reviewer_tabs = st.tabs([f"Evaluator {idx}" for idx in range(1, ROB_REVIEWER_COUNT + 1)])
+        for reviewer_index, reviewer_tab in enumerate(reviewer_tabs, start=1):
+            with reviewer_tab:
+                reviewer_df = result_df[result_df["Evaluator"] == f"Evaluator {reviewer_index}"].copy()
+                st.dataframe(reviewer_df, use_container_width=True)
 
     if error_records:
         st.warning(f"共有 {len(error_records)} 篇全文评估失败，结果已自动填充为 `Error`。")
@@ -2164,9 +2280,9 @@ def render_rob_tab(config: ApiConfig) -> None:
 
     csv_bytes = dataframe_to_csv_bytes(result_df)
     st.download_button(
-        label="下载 RoB 2 结果 CSV",
+        label="下载 3 位评价员完整结果 CSV",
         data=csv_bytes,
-        file_name="rob2_fulltext_results.csv",
+        file_name="rob2_evaluator_results.csv",
         mime="text/csv",
         use_container_width=True,
     )
