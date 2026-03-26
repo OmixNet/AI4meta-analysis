@@ -308,7 +308,7 @@ D5: 报告结果选择的偏倚 (Selection of the reported result)
 【总体偏倚 (Overall) 裁决逻辑】
 你必须在完成 D1-D5 后计算 Overall：
 - Low：只有当 D1-D5 全部为 Low 时。
-- High：只要 D1-D5 中有任意 1 个及以上为 High，或多个域的 Some concerns 叠加严重降低了对结果的信心时。
+- High：只要 D1-D5 中有任意 1 个及以上为 High 时。
 - Some concerns：D1-D5 中没有 High，但包含至少 1 个 Some concerns 时。
 
 【严格输出约束与硬容错规则】
@@ -483,22 +483,45 @@ def normalize_study_name(raw_name: str, fallback: str) -> str:
 
 
 ALLOWED_LOCAL_PATH_SUFFIXES = {".md", ".markdown", ".txt"}
+SENSITIVE_LOCAL_PATH_PREFIXES = tuple(
+    Path(prefix)
+    for prefix in (
+        "/etc",
+        "/private/etc",
+        "/var",
+        "/private/var",
+        "/proc",
+        "/sys",
+        "/dev",
+        "/root",
+        "/tmp",
+        "/private/tmp",
+    )
+)
+
+
+def _is_within_path(path: Path, prefix: Path) -> bool:
+    try:
+        path.relative_to(prefix)
+        return True
+    except ValueError:
+        return False
 
 
 def is_safe_local_path(path: Path) -> bool:
     """Reject paths that attempt directory traversal or access sensitive system locations."""
-    resolved = path.resolve()
-    path_str = str(resolved)
-    sensitive_prefixes = ("/etc", "/var", "/proc", "/sys", "/dev", "/root", "/tmp")
-    for prefix in sensitive_prefixes:
-        if path_str.startswith(prefix):
+    expanded = path.expanduser()
+    absolute_path = expanded.absolute()
+    resolved_path = expanded.resolve()
+    for candidate in (absolute_path, resolved_path):
+        if any(_is_within_path(candidate, prefix) for prefix in SENSITIVE_LOCAL_PATH_PREFIXES):
             return False
-    if resolved.suffix.lower() not in ALLOWED_LOCAL_PATH_SUFFIXES:
+    if resolved_path.suffix.lower() not in ALLOWED_LOCAL_PATH_SUFFIXES:
         return False
     return True
 
 
-def parse_local_fulltext_paths(raw_value: str) -> list[Path]:
+def collect_local_fulltext_paths(raw_value: str) -> list[Path]:
     paths: list[Path] = []
     seen: set[str] = set()
 
@@ -510,12 +533,21 @@ def parse_local_fulltext_paths(raw_value: str) -> list[Path]:
         path_key = str(path.resolve())
         if path_key in seen:
             continue
-        if not is_safe_local_path(path):
-            LOGGER.warning("Rejected unsafe local path: %s", path)
-            continue
         seen.add(path_key)
         paths.append(path)
 
+    return paths
+
+
+def parse_local_fulltext_paths(raw_value: str) -> list[Path]:
+    paths: list[Path] = []
+    for path in collect_local_fulltext_paths(raw_value):
+        if path.suffix.lower() not in FULLTEXT_TEXT_SUFFIXES:
+            continue
+        if not is_safe_local_path(path):
+            LOGGER.warning("Rejected unsafe local path: %s", path)
+            continue
+        paths.append(path)
     return paths
 
 
@@ -1143,7 +1175,7 @@ def fallback_rob_reason(field_name: str, score: str = "Some concerns") -> str:
         if score == "Low":
             return "各域均低风险"
         if score == "High":
-            return "至少一域高风险或多域存疑"
+            return "至少一域高风险"
         return "至少一域存疑"
     return "信息不足"
 
@@ -1219,8 +1251,10 @@ def normalize_evaluator_result(result: dict[str, Any]) -> dict[str, Any]:
     if overall_score_value is None:
         LOGGER.warning("Evaluator 缺少字段：%s，已按 D1-D5 自动计算为 %s", overall_score_key, derived_overall_score)
         overall_score = derived_overall_score
+        overall_score_corrected = False
     else:
         overall_score = normalize_rob_choice(overall_score_value, overall_score_key)
+        overall_score_corrected = overall_score != derived_overall_score
         if overall_score != derived_overall_score:
             LOGGER.warning(
                 "Evaluator Overall 与 D1-D5 不一致：原值=%s，已按规则改写为 %s",
@@ -1233,6 +1267,9 @@ def normalize_evaluator_result(result: dict[str, Any]) -> dict[str, Any]:
     if not overall_reason:
         overall_reason = fallback_rob_reason(overall_reason_key, overall_score)
         LOGGER.warning("Evaluator 缺少字段：%s，已自动填充为 %s", overall_reason_key, overall_reason)
+    elif overall_score_corrected:
+        overall_reason = fallback_rob_reason(overall_reason_key, overall_score)
+        LOGGER.warning("Evaluator %s 已随 Overall 评分改写同步更新为 %s", overall_reason_key, overall_reason)
 
     normalized[overall_score_key] = overall_score
     normalized[overall_reason_key] = overall_reason
@@ -2147,19 +2184,19 @@ def validate_rob_inputs(config: ApiConfig, uploaded_files: list[Any], local_text
     if not validate_api_config(config):
         return False
 
-    parsed_paths = parse_local_fulltext_paths(local_text_paths)
-    if not uploaded_files and not parsed_paths:
+    candidate_paths = collect_local_fulltext_paths(local_text_paths)
+    if not uploaded_files and not candidate_paths:
         st.warning("请先上传至少 1 个 PDF/Markdown/TXT 文件，或填写已提取全文文件路径。")
         return False
 
-    invalid_paths = [str(path) for path in parsed_paths if not path.exists()]
-    if invalid_paths:
-        st.warning("以下全文文件路径不存在：\n" + "\n".join(invalid_paths[:5]))
-        return False
-
-    unsupported_paths = [str(path) for path in parsed_paths if path.suffix.lower() not in FULLTEXT_TEXT_SUFFIXES]
+    unsupported_paths = [str(path) for path in candidate_paths if path.suffix.lower() not in FULLTEXT_TEXT_SUFFIXES]
     if unsupported_paths:
         st.warning("本地全文文件路径仅支持 .md / .txt：\n" + "\n".join(unsupported_paths[:5]))
+        return False
+
+    invalid_paths = [str(path) for path in candidate_paths if not path.exists()]
+    if invalid_paths:
+        st.warning("以下全文文件路径不存在：\n" + "\n".join(invalid_paths[:5]))
         return False
     return True
 
