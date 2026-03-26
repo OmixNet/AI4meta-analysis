@@ -416,7 +416,7 @@ def ensure_dependencies() -> bool:
 
 
 def build_error_result(message: str = "API请求失败或超时") -> dict[str, Any]:
-    display_message = (message[:200] if message else "API请求失败或超时") or "API请求失败或超时"
+    display_message = message[:200] if message else "API请求失败或超时"
     return {
         "score": 0,
         "relevance": "None",
@@ -1720,7 +1720,7 @@ def aggregate_rob_scores(
 ) -> dict[str, Any]:
     started_at = time.perf_counter()
     LOGGER.info("Aggregator start | study=%s", study)
-    normalizer = lambda payload: normalize_aggregator_result(payload, evaluator_results)
+    normalizer = lambda payload, _er=evaluator_results: normalize_aggregator_result(payload, _er)
     try:
         result = call_json_with_retry(
             config=config,
@@ -1793,7 +1793,7 @@ def build_reviewer_output_rows(study: str, evaluator_results: list[dict[str, Any
 
 def build_rob_error_rows(study: str, message: str = "全文偏倚评估失败") -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
-    error_reason = (message[:80] if message else "全文偏倚评估失败") or "全文偏倚评估失败"
+    error_reason = message[:80] if message else "全文偏倚评估失败"
     for reviewer_id in range(1, ROB_REVIEWER_COUNT + 1):
         row = {"Study": study, "Evaluator": f"Evaluator {reviewer_id}"}
         row.update({domain: "Error" for domain in ROB_DOMAINS})
@@ -2002,6 +2002,14 @@ def process_single_document_for_rob(
         }
 
 
+def _safe_int(value: Any, default: int = 0) -> int:
+    """Convert value to int safely, returning default on failure."""
+    try:
+        return int(value) if value is not None else default
+    except (TypeError, ValueError):
+        return default
+
+
 def format_rob_progress_text(total: int, completed: int, study_statuses: dict[str, str]) -> str:
     lines = [f"正在处理全文偏倚评估：{completed} / {total} 篇已完成"]
     if study_statuses:
@@ -2022,24 +2030,24 @@ def consume_rob_progress_events(progress_queue: queue.Queue, study_statuses: dic
 
         stage = event.get("stage", "")
         if stage == "extracting_llm":
-            chunk = int(event.get("chunk", 0) or 0)
-            total = int(event.get("total", 0) or 0)
+            chunk = _safe_int(event.get("chunk"), 0)
+            total = _safe_int(event.get("total"), 0)
             if total > 0:
                 status_text = f"正在执行大模型辅助PDF提取（证据聚焦）...（已完成 {chunk}/{total} 块）"
             else:
                 status_text = "正在执行大模型辅助PDF提取（证据聚焦）..."
         elif stage == "extracted":
             source_kind = str(event.get("source_kind", "pdf"))
-            pages = int(event.get("pages", 0) or 0)
-            chars = int(event.get("chars", 0) or 0)
-            evidence_chars = int(event.get("evidence_chars", 0) or 0)
+            pages = _safe_int(event.get("pages"), 0)
+            chars = _safe_int(event.get("chars"), 0)
+            evidence_chars = _safe_int(event.get("evidence_chars"), 0)
             if source_kind == "text":
                 status_text = f"已加载提取全文：原文约 {chars:,} 字符，评估证据约 {evidence_chars:,} 字符"
             else:
                 status_text = f"PDF文本提取完成：{pages} 页，原文约 {chars:,} 字符，评估证据约 {evidence_chars:,} 字符"
         elif stage == "collecting":
-            completed = int(event.get("completed", 0) or 0)
-            total = int(event.get("total", ROB_REVIEWER_COUNT) or ROB_REVIEWER_COUNT)
+            completed = _safe_int(event.get("completed"), 0)
+            total = _safe_int(event.get("total"), ROB_REVIEWER_COUNT)
             status_text = f"正在收集 {ROB_REVIEWER_COUNT} 位专家的独立评估...（已完成 {completed}/{total}）"
         elif stage == "aggregating":
             status_text = "正在执行 Aggregator 仲裁共识..."
@@ -2071,10 +2079,7 @@ def run_batch_rob_assessment(
     if total == 0:
         return pd.DataFrame(columns=ROB_DETAIL_COLUMNS), []
 
-    results: list[dict[str, Any]] = [
-        {"Study": job["study"], "rows": build_rob_error_rows(job["study"], "任务未执行"), "_error": "任务未执行"}
-        for job in jobs
-    ]
+    results: list[dict[str, Any] | None] = [None] * total
     progress_queue: queue.Queue = queue.Queue()
     study_statuses: dict[str, str] = {}
 
@@ -2126,16 +2131,27 @@ def run_batch_rob_assessment(
 
     consume_rob_progress_events(progress_queue, study_statuses)
 
+    # Fill any slots that were never populated (should not happen, but be safe)
+    for idx, result in enumerate(results):
+        if result is None:
+            results[idx] = {
+                "Study": jobs[idx]["study"],
+                "rows": build_rob_error_rows(jobs[idx]["study"], "任务未执行"),
+                "_error": "任务未执行",
+            }
+
     flattened_rows = [
         {column: row.get(column, "Error") for column in ROB_DETAIL_COLUMNS}
         for result in results
+        if result is not None
         for row in result.get("rows", [])
     ]
     result_df = pd.DataFrame(flattened_rows, columns=ROB_DETAIL_COLUMNS)
     error_records = [
-        {"Study": row["Study"], "Error": row.get("_error", "未知错误")}
-        for row in results
-        if any(item.get(domain) == "Error" for item in row.get("rows", []) for domain in ROB_DOMAINS)
+        {"Study": result["Study"], "Error": result.get("_error", "未知错误")}
+        for result in results
+        if result is not None
+        and any(item.get(domain) == "Error" for item in result.get("rows", []) for domain in ROB_DOMAINS)
     ]
     return result_df, error_records
 
@@ -2215,7 +2231,7 @@ def render_screening_tab(config: ApiConfig, max_workers: int) -> None:
 
     if not run_clicked:
         cached_df = st.session_state.get("screening_result_df")
-        if cached_df is not None:
+        if isinstance(cached_df, pd.DataFrame) and not cached_df.empty:
             st.info("显示上一次筛选结果（点击「开始筛选」可重新运行）。")
             _display_screening_results(cached_df)
         return
@@ -2329,7 +2345,7 @@ def render_rob_tab(config: ApiConfig) -> None:
 
     if not run_clicked:
         cached_rob_df = st.session_state.get("rob_result_df")
-        if cached_rob_df is not None:
+        if isinstance(cached_rob_df, pd.DataFrame) and not cached_rob_df.empty:
             st.info("显示上一次偏倚评估结果（点击按钮可重新运行）。")
             _display_rob_results(cached_rob_df, st.session_state.get("rob_error_records", []))
         return
