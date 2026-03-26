@@ -1,3 +1,4 @@
+import functools
 import io
 import json
 import logging
@@ -307,8 +308,8 @@ D5: 报告结果选择的偏倚 (Selection of the reported result)
 【总体偏倚 (Overall) 裁决逻辑】
 你必须在完成 D1-D5 后计算 Overall：
 - Low：只有当 D1-D5 全部为 Low 时。
-- High：只要 D1-D5 中有任意 1 个及以上为 High 时。
-- Some concerns：只要 D1-D5 中没有 High，但包含至少 1 个 Some concerns 时。
+- High：只要 D1-D5 中有任意 1 个及以上为 High，或多个域的 Some concerns 叠加严重降低了对结果的信心时。
+- Some concerns：D1-D5 中没有 High，但包含至少 1 个 Some concerns 时。
 
 【严格输出约束与硬容错规则】
 - 完整性校验：必须且只能输出包含 12 个键值对的单一 JSON 对象，绝不允许省略。
@@ -415,12 +416,13 @@ def ensure_dependencies() -> bool:
 
 
 def build_error_result(message: str = "API请求失败或超时") -> dict[str, Any]:
+    display_message = (message[:200] if message else "API请求失败或超时") or "API请求失败或超时"
     return {
         "score": 0,
         "relevance": "None",
         "decision": "Error",
-        "rationale": "API请求失败或超时",
-        "error": message[:200] if message else "API请求失败或超时",
+        "rationale": display_message[:50],
+        "error": display_message,
     }
 
 
@@ -480,6 +482,22 @@ def normalize_study_name(raw_name: str, fallback: str) -> str:
     return study or fallback
 
 
+ALLOWED_LOCAL_PATH_SUFFIXES = {".md", ".markdown", ".txt"}
+
+
+def is_safe_local_path(path: Path) -> bool:
+    """Reject paths that attempt directory traversal or access sensitive system locations."""
+    resolved = path.resolve()
+    path_str = str(resolved)
+    sensitive_prefixes = ("/etc", "/var", "/proc", "/sys", "/dev", "/root", "/tmp")
+    for prefix in sensitive_prefixes:
+        if path_str.startswith(prefix):
+            return False
+    if resolved.suffix.lower() not in ALLOWED_LOCAL_PATH_SUFFIXES:
+        return False
+    return True
+
+
 def parse_local_fulltext_paths(raw_value: str) -> list[Path]:
     paths: list[Path] = []
     seen: set[str] = set()
@@ -489,8 +507,11 @@ def parse_local_fulltext_paths(raw_value: str) -> list[Path]:
         if not cleaned:
             continue
         path = Path(cleaned).expanduser()
-        path_key = str(path)
+        path_key = str(path.resolve())
         if path_key in seen:
+            continue
+        if not is_safe_local_path(path):
+            LOGGER.warning("Rejected unsafe local path: %s", path)
             continue
         seen.add(path_key)
         paths.append(path)
@@ -624,12 +645,14 @@ def build_screening_messages(topic: str, title: str, abstract: str) -> list[dict
 
 def extract_json_text(raw_text: str) -> str:
     text = raw_text.strip()
+    fenced = re.match(r"^```(?:\w+)?\s*\n(.*?)```\s*$", text, re.DOTALL)
+    if fenced:
+        return fenced.group(1).strip()
     if text.startswith("```"):
-        text = text.strip("`")
+        text = text.lstrip("`").strip()
         if "\n" in text:
             text = text.split("\n", 1)[1]
-        if text.endswith("```"):
-            text = text[:-3]
+        text = text.rstrip("`").strip()
     return text.strip()
 
 
@@ -1102,12 +1125,15 @@ def normalize_rob_choice(value: Any, field_name: str) -> str:
 
 
 def derive_overall_rob_score(domain_scores: dict[str, str]) -> str:
+    """Derive Overall RoB 2 score strictly following Cochrane rules:
+    - Low: all domains are Low
+    - High: any domain is High
+    - Some concerns: otherwise (at least one domain is Some concerns, none is High)
+    """
     evaluator_scores = [domain_scores.get(domain, "Some concerns") for domain in ROB_EVALUATOR_DOMAINS]
     if all(score == "Low" for score in evaluator_scores):
         return "Low"
     if any(score == "High" for score in evaluator_scores):
-        return "High"
-    if sum(score == "Some concerns" for score in evaluator_scores) >= 2:
         return "High"
     return "Some concerns"
 
@@ -1285,6 +1311,14 @@ def extract_message_content(message_content: Any) -> str:
     return json.dumps(message_content, ensure_ascii=False)
 
 
+@functools.lru_cache(maxsize=4)
+def _get_openai_client(api_key: str, base_url: str) -> Any:
+    """Cache OpenAI client instances to reuse TCP connections across calls."""
+    if OpenAI is None:
+        raise RuntimeError("openai 依赖未安装。")
+    return OpenAI(api_key=api_key, base_url=base_url)
+
+
 def _call_json_once(
     config: ApiConfig,
     messages: list[dict[str, str]],
@@ -1293,20 +1327,21 @@ def _call_json_once(
     timeout_seconds: float = SCREENING_TIMEOUT_SECONDS,
     max_tokens: int = SCREENING_MAX_TOKENS,
 ) -> dict[str, Any]:
-    if OpenAI is None:
-        raise RuntimeError("openai 依赖未安装。")
-
-    client = OpenAI(api_key=config.api_key, base_url=config.base_url, timeout=timeout_seconds)
+    client = _get_openai_client(config.api_key, config.base_url)
     request_kwargs: dict[str, Any] = {
         "model": config.model_name,
         "messages": messages,
         "temperature": temperature,
         "response_format": {"type": "json_object"},
+        "timeout": timeout_seconds,
     }
     if max_tokens > 0:
         request_kwargs["max_tokens"] = max_tokens
 
     response = client.chat.completions.create(**request_kwargs)
+
+    if not response.choices:
+        raise ValueError("API 返回结果中 choices 为空，可能是模型服务异常。")
 
     content = extract_message_content(response.choices[0].message.content) or "{}"
     json_text = extract_json_text(content)
@@ -1728,6 +1763,11 @@ def build_rob_error_rows(study: str, message: str = "全文偏倚评估失败") 
         row.update({f"{domain}_reason": error_reason for domain in ROB_DOMAINS})
         row["_error"] = message[:200] if message else "全文偏倚评估失败"
         rows.append(row)
+    consensus_row = {"Study": study, "Evaluator": "Consensus"}
+    consensus_row.update({domain: "Error" for domain in ROB_DOMAINS})
+    consensus_row.update({f"{domain}_reason": error_reason for domain in ROB_DOMAINS})
+    consensus_row["_error"] = message[:200] if message else "全文偏倚评估失败"
+    rows.append(consensus_row)
     return rows
 
 
@@ -1738,21 +1778,21 @@ def prepare_rob_jobs(uploaded_files: list[Any], local_text_paths: str = "") -> l
 
     for uploaded_file in uploaded_files:
         file_name = str(getattr(uploaded_file, "name", "") or "")
-        suffix = Path(file_name).suffix.lower()
-        if suffix not in {".pdf", *FULLTEXT_TEXT_SUFFIXES}:
+        file_suffix = Path(file_name).suffix.lower()
+        if file_suffix not in {".pdf", *FULLTEXT_TEXT_SUFFIXES}:
             continue
 
         base_study = normalize_study_name(Path(file_name).stem, f"Study_{next_index + 1}")
         study_name_counter[base_study] += 1
-        suffix = study_name_counter[base_study]
-        study = base_study if suffix == 1 else f"{base_study} ({suffix})"
+        name_count = study_name_counter[base_study]
+        study = base_study if name_count == 1 else f"{base_study} ({name_count})"
         jobs.append(
             {
                 "index": next_index,
                 "study": study,
-                "source_kind": "pdf" if Path(file_name).suffix.lower() == ".pdf" else "text_upload",
+                "source_kind": "pdf" if file_suffix == ".pdf" else "text_upload",
                 "source_name": file_name,
-                "suffix": Path(file_name).suffix.lower(),
+                "suffix": file_suffix,
                 "bytes": uploaded_file.getvalue(),
             }
         )
@@ -1761,8 +1801,8 @@ def prepare_rob_jobs(uploaded_files: list[Any], local_text_paths: str = "") -> l
     for path in parse_local_fulltext_paths(local_text_paths):
         base_study = normalize_study_name(path.stem, f"Study_{next_index + 1}")
         study_name_counter[base_study] += 1
-        suffix = study_name_counter[base_study]
-        study = base_study if suffix == 1 else f"{base_study} ({suffix})"
+        name_count = study_name_counter[base_study]
+        study = base_study if name_count == 1 else f"{base_study} ({name_count})"
         jobs.append(
             {
                 "index": next_index,
@@ -1893,8 +1933,21 @@ def process_single_document_for_rob(
         else:
             executor.shutdown(wait=True)
 
+        progress_queue.put({"study": study, "stage": "aggregating"})
+        aggregator_result = aggregate_rob_scores(config, study, evaluator_results)
+        LOGGER.info(
+            "Aggregator completed | study=%s | overall=%s",
+            study,
+            aggregator_result.get("Overall", "?"),
+        )
+
         progress_queue.put({"study": study, "stage": "completed"})
         reviewer_rows = build_reviewer_output_rows(study, evaluator_results)
+        aggregator_row = {"Study": study, "Evaluator": "Consensus"}
+        for domain in ROB_DOMAINS:
+            aggregator_row[domain] = aggregator_result.get(domain, "Error")
+            aggregator_row[f"{domain}_reason"] = "仲裁共识"
+        reviewer_rows.append(aggregator_row)
         LOGGER.info("Study completed | study=%s | reviewers=%s", study, len(reviewer_rows))
         return {
             "Study": study,
@@ -1951,8 +2004,10 @@ def consume_rob_progress_events(progress_queue: queue.Queue, study_statuses: dic
             completed = int(event.get("completed", 0) or 0)
             total = int(event.get("total", ROB_REVIEWER_COUNT) or ROB_REVIEWER_COUNT)
             status_text = f"正在收集 {ROB_REVIEWER_COUNT} 位专家的独立评估...（已完成 {completed}/{total}）"
+        elif stage == "aggregating":
+            status_text = "正在执行 Aggregator 仲裁共识..."
         elif stage == "completed":
-            status_text = "3 位评价员结果已生成"
+            status_text = "3 位评价员 + Aggregator 仲裁结果已生成"
         elif stage == "error":
             status_text = f"处理失败：{event.get('message', '未知错误')[:120]}"
         else:
@@ -2122,6 +2177,10 @@ def render_screening_tab(config: ApiConfig, max_workers: int) -> None:
     run_clicked = st.button("开始筛选", type="primary", use_container_width=True, key="screening_run")
 
     if not run_clicked:
+        cached_df = st.session_state.get("screening_result_df")
+        if cached_df is not None:
+            st.info("显示上一次筛选结果（点击「开始筛选」可重新运行）。")
+            _display_screening_results(cached_df)
         return
 
     if not validate_screening_inputs(config, topic.strip(), uploaded_file):
@@ -2161,7 +2220,12 @@ def render_screening_tab(config: ApiConfig, max_workers: int) -> None:
 
     progress_bar.progress(1.0)
     status_placeholder.success(f"处理完成: {len(result_df)} / {len(result_df)} 篇")
+    st.session_state["screening_result_df"] = result_df
 
+    _display_screening_results(result_df)
+
+
+def _display_screening_results(result_df: pd.DataFrame) -> None:
     st.subheader("结果预览（前 5 条）")
     st.dataframe(result_df.head(5), use_container_width=True)
 
@@ -2227,6 +2291,10 @@ def render_rob_tab(config: ApiConfig) -> None:
     )
 
     if not run_clicked:
+        cached_rob_df = st.session_state.get("rob_result_df")
+        if cached_rob_df is not None:
+            st.info("显示上一次偏倚评估结果（点击按钮可重新运行）。")
+            _display_rob_results(cached_rob_df, st.session_state.get("rob_error_records", []))
         return
 
     uploaded_file_list = list(uploaded_files or [])
@@ -2251,7 +2319,13 @@ def render_rob_tab(config: ApiConfig) -> None:
 
     progress_bar.progress(1.0)
     status_placeholder.success(f"处理完成: {len(jobs)} / {len(jobs)} 篇")
+    st.session_state["rob_result_df"] = result_df
+    st.session_state["rob_error_records"] = error_records
 
+    _display_rob_results(result_df, error_records)
+
+
+def _display_rob_results(result_df: pd.DataFrame, error_records: list[dict[str, str]]) -> None:
     summary_df = result_df[ROB_SUMMARY_COLUMNS].copy()
 
     st.subheader("RoB 2 评价员评分表")
@@ -2260,27 +2334,32 @@ def render_rob_tab(config: ApiConfig) -> None:
     with st.expander("查看含理由的完整明细表", expanded=True):
         st.dataframe(result_df, use_container_width=True)
 
-        reviewer_tabs = st.tabs([f"Evaluator {idx}" for idx in range(1, ROB_REVIEWER_COUNT + 1)])
-        for reviewer_index, reviewer_tab in enumerate(reviewer_tabs, start=1):
+        tab_labels = [f"Evaluator {idx}" for idx in range(1, ROB_REVIEWER_COUNT + 1)] + ["Consensus"]
+        reviewer_tabs = st.tabs(tab_labels)
+        for tab_index, reviewer_tab in enumerate(reviewer_tabs):
             with reviewer_tab:
-                reviewer_df = result_df[result_df["Evaluator"] == f"Evaluator {reviewer_index}"].copy()
+                if tab_index < ROB_REVIEWER_COUNT:
+                    label = f"Evaluator {tab_index + 1}"
+                else:
+                    label = "Consensus"
+                reviewer_df = result_df[result_df["Evaluator"] == label].copy()
                 st.dataframe(reviewer_df, use_container_width=True)
 
     if error_records:
         st.warning(f"共有 {len(error_records)} 篇全文评估失败，结果已自动填充为 `Error`。")
         error_df = pd.DataFrame(error_records)
         error_summary = Counter(record["Error"] or "未知错误" for record in error_records)
-        summary_df = pd.DataFrame(
+        err_summary_df = pd.DataFrame(
             [{"错误原因": reason, "数量": count} for reason, count in error_summary.most_common()]
         )
         st.subheader("失败原因汇总")
-        st.dataframe(summary_df, use_container_width=True)
+        st.dataframe(err_summary_df, use_container_width=True)
         st.subheader("失败文章明细")
         st.dataframe(error_df, use_container_width=True)
 
     csv_bytes = dataframe_to_csv_bytes(result_df)
     st.download_button(
-        label="下载 3 位评价员完整结果 CSV",
+        label="下载评价员 + 仲裁共识结果 CSV",
         data=csv_bytes,
         file_name="rob2_evaluator_results.csv",
         mime="text/csv",
