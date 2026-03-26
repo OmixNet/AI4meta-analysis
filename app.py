@@ -53,6 +53,9 @@ DEFAULT_TOPIC = (
     "并实现脂肪病变的更早发现及特征分析。"
 )
 DEFAULT_BASE_URL = "https://api.openai.com/v1"
+KIMI_THINKING_ENABLED = False
+KIMI_THINKING_TEMPERATURE = 1.0
+KIMI_INSTANT_TEMPERATURE = 0.6
 SCREENING_TIMEOUT_SECONDS = 60.0
 EVALUATOR_TIMEOUT_SECONDS = 90.0
 AGGREGATOR_TIMEOUT_SECONDS = 60.0
@@ -373,6 +376,11 @@ class ApiConfig:
     api_key: str
     base_url: str
     model_name: str
+
+
+def is_kimi_model(model_name: str) -> bool:
+    """检测是否为 Kimi 系列模型（kimi-k2.5 / kimi-k2-thinking 等）。"""
+    return model_name.strip().lower().startswith("kimi-")
 
 
 def is_retryable_exception(exc: Exception) -> bool:
@@ -1365,15 +1373,34 @@ def _call_json_once(
     max_tokens: int = SCREENING_MAX_TOKENS,
 ) -> dict[str, Any]:
     client = _get_openai_client(config.api_key, config.base_url)
+    use_kimi = is_kimi_model(config.model_name)
+
     request_kwargs: dict[str, Any] = {
         "model": config.model_name,
         "messages": messages,
-        "temperature": temperature,
         "response_format": {"type": "json_object"},
         "timeout": timeout_seconds,
     }
+
+    if use_kimi:
+        if KIMI_THINKING_ENABLED:
+            request_kwargs["temperature"] = KIMI_THINKING_TEMPERATURE
+        else:
+            request_kwargs["temperature"] = KIMI_INSTANT_TEMPERATURE
+            request_kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
+    else:
+        request_kwargs["temperature"] = temperature
+
     if max_tokens > 0:
         request_kwargs["max_tokens"] = max_tokens
+
+    LOGGER.info(
+        "API request | model=%s | kimi=%s | thinking=%s | timeout=%.0fs",
+        config.model_name,
+        use_kimi,
+        KIMI_THINKING_ENABLED if use_kimi else "n/a",
+        timeout_seconds,
+    )
 
     response = client.chat.completions.create(**request_kwargs)
 
